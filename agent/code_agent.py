@@ -5,16 +5,21 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import TextMessage
 from autogen_ext.code_executors.docker import DockerCommandLineCodeExecutor
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.tools.code_execution import PythonCodeExecutionTool
 from dotenv import load_dotenv
+
+# stage label, detail line for UI progress
+ProgressCallback = Callable[[str, str], None]
 
 load_dotenv()
 
@@ -112,14 +117,25 @@ def _parse_result(messages: list[Any]) -> AgentResult:
     return result
 
 
+def _emit(on_progress: ProgressCallback | None, stage: str, detail: str) -> None:
+    if on_progress:
+        on_progress(stage, detail)
+
+
+def _execution_failed(output: str, is_error: bool) -> bool:
+    return is_error or ("Traceback" in output)
+
+
 async def run_coding_task(
     task: str,
     conversation_history: list[dict[str, str]] | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> AgentResult:
     """
     Generate Python code, run it in a Docker sandbox, and auto-fix on errors.
 
     conversation_history: optional list of {"role": "user"|"assistant", "content": "..."}
+    on_progress: optional callback(stage, detail) for live UI updates
     """
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
@@ -155,6 +171,8 @@ async def run_coding_task(
         },
     )
 
+    _emit(on_progress, "Starting", "Starting Docker sandbox...")
+
     async with DockerCommandLineCodeExecutor(
         work_dir=WORK_DIR,
         timeout=60,
@@ -172,8 +190,72 @@ async def run_coding_task(
             max_tool_iterations=5,  # generate → run → fix → re-run
         )
 
-        task_result = await agent.run(task=prompt)
-        parsed = _parse_result(list(task_result.messages))
+        _emit(on_progress, "Thinking", "Asking the model to solve the task...")
+
+        messages: list[Any] = []
+        attempt = 0
+        last_failed = False
+
+        async for item in agent.run_stream(task=prompt):
+            if isinstance(item, TaskResult):
+                messages = list(item.messages)
+                break
+
+            msg_type = type(item).__name__
+
+            if msg_type == "ToolCallRequestEvent":
+                attempt += 1
+                if last_failed:
+                    _emit(
+                        on_progress,
+                        "Fixing",
+                        f"Attempt {attempt}: fixing code after error...",
+                    )
+                else:
+                    _emit(
+                        on_progress,
+                        "Generating",
+                        f"Attempt {attempt}: generating Python code...",
+                    )
+                _emit(
+                    on_progress,
+                    "Executing",
+                    f"Attempt {attempt}: running code in Docker...",
+                )
+
+            elif msg_type == "ToolCallExecutionEvent" and getattr(item, "content", None):
+                outputs = []
+                failed = False
+                for exec_result in item.content:
+                    output = getattr(exec_result, "content", "") or ""
+                    outputs.append(output)
+                    if _execution_failed(
+                        output, bool(getattr(exec_result, "is_error", False))
+                    ):
+                        failed = True
+                last_failed = failed
+                preview = (outputs[0][:120] + "…") if outputs and len(outputs[0]) > 120 else (outputs[0] if outputs else "")
+                if failed:
+                    _emit(
+                        on_progress,
+                        "Analyzing",
+                        f"Attempt {attempt}: execution failed — analyzing error...",
+                    )
+                else:
+                    _emit(
+                        on_progress,
+                        "Analyzing",
+                        f"Attempt {attempt}: execution succeeded."
+                        + (f" Output: {preview}" if preview else ""),
+                    )
+
+            elif msg_type in ("TextMessage", "ToolCallSummaryMessage"):
+                source = getattr(item, "source", "")
+                if source != "user":
+                    _emit(on_progress, "Explaining", "Writing final explanation...")
+
+        parsed = _parse_result(messages)
+        _emit(on_progress, "Done", "Finished.")
 
     await model_client.close()
     return parsed

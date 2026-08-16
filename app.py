@@ -62,29 +62,46 @@ task = st.text_area(
 )
 run = st.button("Run CodePilot", type="primary", use_container_width=True)
 
-# ---- Run agent ----
+# ---- Run agent with live step progress ----
 if run:
     if not task.strip():
         st.warning("Please enter a coding task.")
     else:
-        with st.spinner("Agent is generating and executing code in Docker..."):
-            try:
-                history = st.session_state.history if use_memory else None
-                result = asyncio.run(run_coding_task(task.strip(), history))
-                st.session_state.last_result = result
-                st.session_state.history.append({"role": "user", "content": task.strip()})
-                st.session_state.history.append(
-                    {"role": "assistant", "content": result.final_response}
+        try:
+            history = st.session_state.history if use_memory else None
+
+            with st.status("CodePilot is working...", expanded=True) as status:
+
+                def on_progress(stage: str, detail: str) -> None:
+                    # Live step line + update the status header
+                    st.write(f"**{stage}** — {detail}")
+                    status.update(label=f"{stage}: {detail}", state="running")
+
+                result = asyncio.run(
+                    run_coding_task(task.strip(), history, on_progress=on_progress)
                 )
-            except Exception as exc:
-                st.error(f"Failed to run agent: {exc}")
-                st.stop()
+
+                if result.success:
+                    status.update(label="Done — code ran successfully", state="complete")
+                else:
+                    status.update(
+                        label="Done — completed with errors", state="error"
+                    )
+
+            st.session_state.last_result = result
+            st.session_state.history.append({"role": "user", "content": task.strip()})
+            st.session_state.history.append(
+                {"role": "assistant", "content": result.final_response}
+            )
+        except Exception as exc:
+            st.error(f"Failed to run agent: {exc}")
+            st.stop()
 
 # ---- Display result ----
 result = st.session_state.last_result
 if result is not None:
-    status = "Success" if result.success else "Completed with errors"
-    st.subheader(f"Result — {status}")
+    status_label = "Success" if result.success else "Completed with errors"
+    st.subheader(f"Result — {status_label}")
 
     col1, col2 = st.columns(2)
 
